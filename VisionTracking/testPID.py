@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+#----------------------------------------------------------------------------
+# Copyright (c) 2018 FIRST. All Rights Reserved.
+# Open Source Software - may be modified and shared by FRC teams. The code
+# must be accompanied by the FIRST BSD license file in the root directory of
+# the project.
+#----------------------------------------------------------------------------
+
+
+
+import json
+import time
+import sys
+import numpy as np
+import cv2
+from networktables import NetworkTables
+from cscore import CameraServer, VideoSource, UsbCamera, MjpegServer
+
+ip = '10.30.6.2'
+
+NetworkTables.initialize(server=ip)
+
+lower_green = np.array([0, 255, 110]) #137 240 135 - HSV, 0,90,90 - RGB
+upper_green = np.array([80, 255, 200]) #143 255 148 - HSV, 86,255,255 - RGB
+
+#Camera constants
+camWidth = 320
+camHeight = 240
+center_x = camWidth * .5
+margin = 20
+
+#PID Constants
+Kp = 2/center_x
+Ki = 10
+Kd = 100
+integral = 0
+integral_damping = .75
+last_error = 0
+
+cs = CameraServer.getInstance()
+cs.enableLogging()
+
+cam1 = UsbCamera("cam1", 0)
+cam2 = UsbCamera("cam2", 1)
+
+cam1.setResolution(camWidth, camHeight)
+cam2.setResolution(camWidth, camHeight)
+
+cam1.setExposureManual(8)
+cam2.setExposureManual(8)
+
+cvSink = cs.getVideo(camera = cam1)
+
+outputStream = cs.putVideo("Cam1", camWidth, camHeight)
+
+frame = np.zeros(shape=(camHeight, camWidth, 3), dtype=np.uint8)
+
+#Makes Raspberry Pi a listener to detect changes sent from roboRIO
+def listener(table, key, value, isNew):
+	print("value changed: key: '%s'; value: %s; isNew: %s" % (key, value, isNew))
+	return value
+def connectionListener(connected, info):
+	print(info, "; Connected=%s" % connected)
+
+sd = NetworkTables.getTable("SmartDashboard")
+sd.putString('dir', 'working')
+
+NetworkTables.addConnectionListener(connectionListener, immediateNotify = True)
+sd.addEntryListener(listener, key="cam")
+
+print(sd.getString(key="cam", defaultValue = ""))
+
+font = cv2.FONT_HERSHEY_SIMPLEX
+
+while(True):
+	camMode = sd.getString(key="cam", defaultValue = "y")
+
+	if(camMode == "y"):
+		cvSink.setSource(cam2)
+	else:
+		cvSink.setSource(cam1)
+
+	time, frame = cvSink.grabFrame(frame)
+	
+	hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+	mask = cv2.inRange(hsv, lower_green, upper_green)
+	contours = cv2.findContours(mask,cv2.RETR_TREE,cv2.CHAIN_APPROX_SIMPLE)[-2] 
+	
+	largest_area = 0
+	largest_contour = np.array([0, 0])
+	sec_largest_area = 0
+	sec_largest_contour = np.array([0, 0])
+	
+	for c in contours:
+		area = cv2.contourArea(c)
+		if area > largest_area:
+			sec_largest_contour = largest_contour
+			sec_largest_area = largest_area
+			largest_contour = c
+			largest_area = area
+		elif area > sec_largest_area:
+			sec_largest_contour = c
+			sec_largest_area = area
+
+	cv2.putText(frame, str(largest_area), (45, 100), font, 1, (255,255,255), 2, cv2.LINE_AA)
+	cv2.putText(frame, str(sec_largest_area), (45, 150), font, 1, (255,255,255), 2, cv2.LINE_AA)
+
+	if(largest_area > 0 and sec_largest_area > 0):
+		M1 = cv2.moments(largest_contour)
+		center_contour_x = int(M1['m10']/M1['m00'])
+		
+		M2 = cv2.moments(sec_largest_contour)
+		center_contour_x_2 = int(M2['m10']/M2['m00'])
+		
+		center_average_x = .5 * (center_contour_x + center_contour_x_2)
+		
+		cv2.drawContours(frame, [largest_contour], 0, (0, 0, 255), 3)
+		cv2.drawContours(frame, [sec_largest_contour], 0, (0, 0 , 255), 3)
+	
+	elif(largest_area > 0 and sec_largest_area == 0):
+		M1 = cv2.moments(largest_contour)
+		center_average_x = int(M1['m10']/M1['m00'])
+
+		cv2.drawContours(frame, [largest_contour], 0, (0, 0, 255), 3)
+
+	error = center_average_x - center_x
+
+	integral = integral_damping * integral + error
+	derivative = error - last_error
+	turn_amt = Kp * error + Ki * integral + Kd * derivative
+	last_error = error
+
+	sd.putNumber('dir', turn_amt)
+
+	outputStream.putFrame(frame)
+	
+NetworkTables.shutdown()
+cap.release()
+cv2.destroyAllWindows()
